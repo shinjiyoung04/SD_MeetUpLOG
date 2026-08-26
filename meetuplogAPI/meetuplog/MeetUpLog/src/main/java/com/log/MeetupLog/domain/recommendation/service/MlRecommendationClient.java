@@ -135,7 +135,10 @@ public class MlRecommendationClient {
         List<String> people = new ArrayList<>();
         List<String> countries = new ArrayList<>();
         List<String> certifications = new ArrayList<>();
+        List<String> ottPlatforms = new ArrayList<>();
         Integer maxRuntime = null;
+        Integer minYear = null;
+        boolean prefersTheater = false;
 
         for (JsonNode member : members) {
             appendFieldNames(likes, member.path("liked_genres"), 3);
@@ -145,9 +148,15 @@ public class MlRecommendationClient {
             appendPersonNames(people, member.path("liked_directors"), 2);
             appendCountryNames(countries, member.path("countries"), 2);
             appendTextValues(certifications, member.path("certifications"), 2);
+            appendTextValues(ottPlatforms, member.path("ott_platforms"), 3);
+            prefersTheater = prefersTheater || member.path("prefers_theater").asBoolean(false);
             if (member.path("max_runtime").canConvertToInt()) {
                 int value = member.path("max_runtime").asInt();
                 maxRuntime = maxRuntime == null ? value : Math.min(maxRuntime, value);
+            }
+            if (member.path("min_year").canConvertToInt()) {
+                int value = member.path("min_year").asInt();
+                minYear = minYear == null ? value : Math.max(minYear, value);
             }
         }
 
@@ -157,11 +166,16 @@ public class MlRecommendationClient {
         if (!people.isEmpty()) parts.add(String.join("·", distinctLimit(people, 2)) + " 관련 작품 선호");
         if (!countries.isEmpty()) parts.add(String.join("·", distinctLimit(countries, 2)) + " 영화 선호");
         if (!certifications.isEmpty()) parts.add(String.join("·", distinctLimit(certifications, 2)) + " 관람등급 적용");
+        if (!ottPlatforms.isEmpty()) {
+            parts.add(String.join("·", distinctLimit(ottPlatforms, 3)) + " 시청 경로 고려");
+        }
+        if (prefersTheater) parts.add("영화관 상영 여부 고려");
+        if (minYear != null) parts.add(minYear + "년 이후 최신작 조건");
         if (maxRuntime != null) parts.add(maxRuntime + "분 이하 러닝타임 고려");
 
         return parts.isEmpty()
                 ? "최근 대화에서 드러난 구성원별 취향과 그룹 적합도를 함께 고려했어요."
-                : String.join(", ", parts) + "를 함께 고려했어요.";
+                : String.join(", ", parts) + " 등 대화 조건을 함께 고려했어요.";
     }
 
     private void appendFieldNames(List<String> target, JsonNode object, int limit) {

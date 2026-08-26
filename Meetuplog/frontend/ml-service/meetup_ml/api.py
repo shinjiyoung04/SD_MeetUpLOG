@@ -27,6 +27,7 @@ from .recommender import (
 )
 from .semantic import SemanticPreferenceEngine
 from .text_correction import KoreanTextCorrector
+from .watchmode import attach_direct_provider_links
 from .schemas import (
     ChatAnalyzeRequest,
     ChatMessage,
@@ -170,6 +171,7 @@ def _analyze_corrected(
     messages: list[ChatMessage],
     movies,
     room_id: str = "__direct__",
+    enrichment_message_ids: set[int] | None = None,
 ):
     corrected_messages: list[ChatMessage] = []
     corrections: list[tuple[str, str, str, str]] = []
@@ -210,6 +212,12 @@ def _analyze_corrected(
     }
 
     for message in corrected_messages:
+        if (
+            enrichment_message_ids is not None
+            and message.message_id not in enrichment_message_ids
+        ):
+            continue
+
         text = message.text.strip()
 
         # 너무 짧거나 일반 잡담은 TMDB 검색하지 않음
@@ -302,6 +310,26 @@ def warm_recommendation_runtime() -> None:
         # 선택적 임베딩 모델이 준비되지 않았어도 서버 시작은 유지하고,
         # 실제 요청에서 기존 fallback 경로를 사용할 수 있게 둡니다.
         return
+
+
+def _person_identity_readiness(movies) -> dict:
+    """카탈로그의 배우·감독이 이름 문자열이 아닌 TMDB ID로 식별됐는지 요약합니다."""
+    credits = [
+        credit
+        for movie in movies
+        for credit in [
+            *(movie.cast_people or []),
+            *(movie.director_people or []),
+        ]
+    ]
+    identified = sum(credit.person_id is not None for credit in credits)
+    coverage = round(identified / len(credits), 4) if credits else 0.0
+    return {
+        "structured_credits": len(credits),
+        "identified_credits": identified,
+        "id_coverage": coverage,
+        "production_ready": bool(credits) and coverage >= 0.95,
+    }
 
 training_state = {
     "running": False,
@@ -706,12 +734,30 @@ def _apply_watch_preferences(
     채팅 분석 결과에 저장된 OTT 및 영화관 조건을
     실제 추천 요청 필터에 반영한다.
     """
-    requested_platforms = list(
+    strict_platforms = list(
+        dict.fromkeys(
+            platform
+            for member in request.members
+            if member.ott_strict
+            for platform in member.ott_platforms
+        )
+    )
+
+    requested_platforms = strict_platforms or list(
         dict.fromkeys(
             platform
             for member in request.members
             for platform in member.ott_platforms
         )
+    )
+
+    theater_requested = any(
+        member.prefers_theater
+        for member in request.members
+    )
+    mixed_watch_preferences = bool(
+        requested_platforms
+        and theater_requested
     )
 
     detected_provider_ids = (
@@ -721,7 +767,10 @@ def _apply_watch_preferences(
         )
     )
 
-    if detected_provider_ids:
+    # OTT와 영화관 의견이 함께 나오면 어느 한쪽을 전체 그룹의 하드
+    # 필터로 승격하지 않는다. 각 구성원 적합도에서 두 의견을 비교해
+    # 한 사람의 시청 방식이 다른 사람의 조건을 지우지 않게 한다.
+    if detected_provider_ids and not mixed_watch_preferences:
         existing_provider_ids = set(
             request.allowed_providers
         )
@@ -731,20 +780,12 @@ def _apply_watch_preferences(
             | detected_provider_ids
         )
 
-    strict_ott_requested = any(
-        member.ott_strict
-        for member in request.members
-    )
+    strict_ott_requested = bool(strict_platforms)
 
     if strict_ott_requested:
         request.include_unknown_watch_path = False
 
-    theater_requested = any(
-        member.prefers_theater
-        for member in request.members
-    )
-
-    if theater_requested:
+    if theater_requested and not requested_platforms:
         request.require_now_playing = True
 
 
@@ -761,12 +802,14 @@ def _run_group_recommendation(
     request: GroupRecommendRequest,
     catalog=None,
     room_messages=None,
+    include_history_exclusions: bool = True,
 ):
     # The product contract is three cards, not "up to three".
     request.limit = RECOMMENDATION_CARD_COUNT
     # Spring이 이전 카드 ID를 전달하지 못하는 구버전으로 실행 중이어도
     # ML 자체 추천 이력을 합쳐 같은 방에 동일 영화를 다시 노출하지 않는다.
-    _merge_historical_recommendation_exclusions(request)
+    if include_history_exclusions:
+        _merge_historical_recommendation_exclusions(request)
     if room_messages is None:
         # 누적 채팅 상태 기반 API는 저장된 최근 메시지를 사용합니다.
         room_messages = [
@@ -777,26 +820,30 @@ def _run_group_recommendation(
             if message.user_id != "AI"
         ][-20:]
 
-    # 최근 채팅에서 영화관 관람 의도가 감지되면
-    # 현재 상영 중인 영화만 추천하도록 설정한다.
-    request.require_now_playing = (
-        request.require_now_playing
-        or any(
-            detect_theater_intent(
-                message.text
-            )
-            for message in room_messages
-        )
+    # 분석기가 영화관 표현을 놓친 경우에만 원문 감지를 보조로 쓴다.
+    # OTT 의견과 영화관 의견이 섞인 방에서는 한쪽을 전체 하드 필터로
+    # 만들지 않고 아래 구성원별 점수로 합의를 찾는다.
+    raw_theater_requested = any(
+        detect_theater_intent(message.text)
+        for message in room_messages
     )
+    has_ott_preference = any(
+        member.ott_platforms
+        for member in request.members
+    )
+    if raw_theater_requested and not has_ott_preference:
+        request.require_now_playing = True
 
     movies = [
         movie
-        for movie in (
-            catalog
-            if catalog is not None
-            else store.load_movies()
+        for movie in (catalog if catalog is not None else store.load_movies())
+        if (
+            movie.recommendation_eligible
+            or has_verified_requested_certification(
+                movie,
+                request.members,
+            )
         )
-        if movie.recommendation_eligible
     ]
 
     # 분석된 OTT와 영화관 관람 조건을
@@ -830,6 +877,13 @@ def _run_group_recommendation(
                 }
             },
         )
+
+    # 추천 순위가 확정된 3편에만 작품별 OTT 주소를 보강합니다.
+    # API 키가 없거나 외부 조회가 실패해도 기존 추천·검색 링크는 그대로 동작합니다.
+    attach_direct_provider_links(
+        recommendation.movie
+        for recommendation in result.recommendations
+    )
 
     database.save_recommendations(
         request.room_id,
@@ -868,6 +922,20 @@ def recommendation_from_chat(
         request.room_id,
     )
 
+    previous_members = database.preferences(request.room_id)
+    cumulative_members = _merge_preferences(
+        previous_members,
+        analysis.members,
+    )
+    preference_state_changed = (
+        _preference_snapshot(previous_members)
+        != _preference_snapshot(cumulative_members)
+    )
+    analysis = analysis.model_copy(
+        update={"members": cumulative_members},
+        deep=True,
+    )
+
     if not analysis.members:
         raise HTTPException(
             status_code=409,
@@ -889,12 +957,26 @@ def recommendation_from_chat(
         limit=request.limit,
         include_unknown_watch_path=request.include_unknown_watch_path,
         require_now_playing=request.require_now_playing,
-        excluded_movie_ids=request.excluded_movie_ids,
+        # 조건이 추가되거나 바뀐 재추천은 기존 TOP 3까지 새 조건으로
+        # 다시 평가한다. 같은 조건으로 누른 재추천만 이전 결과를 제외해
+        # 실제 "다른 영화 보기"처럼 동작시킨다.
+        excluded_movie_ids=(
+            request.excluded_movie_ids
+            if not preference_state_changed
+            else []
+        ),
     )
     recommendation = _run_group_recommendation(
         group_request,
         catalog=catalog,
         room_messages=user_messages[-20:],
+        include_history_exclusions=(
+            not preference_state_changed
+        ),
+    )
+    database.save_preferences(
+        request.room_id,
+        cumulative_members,
     )
 
     return {
@@ -1212,6 +1294,21 @@ def _merge_preferences(
     )
 
 
+def _preference_snapshot(
+    members: list[Preference],
+) -> dict[str, dict]:
+    """비교 가능한 방별 선호 스냅샷을 만든다."""
+    return {
+        member.user_id: member.model_dump(
+            mode="json"
+        )
+        for member in sorted(
+            members,
+            key=lambda item: item.user_id,
+        )
+    }
+
+
 def _room_analysis(room_id: str):
     room_movies = store.load_movies()
     movie_titles = {
@@ -1264,7 +1361,7 @@ def _room_analysis(room_id: str):
             database.context_messages(
                 room_id,
                 checkpoint,
-                limit=200,
+                limit=12,
             )
             if checkpoint
             else []
@@ -1322,6 +1419,11 @@ def _room_analysis(room_id: str):
                 analysis_input,
                 room_movies,
                 room_id,
+                enrichment_message_ids={
+                    message.message_id
+                    for message in pending_user_messages
+                    if message.message_id is not None
+                },
             )
             print("result = ", result)
             
@@ -1335,10 +1437,13 @@ def _room_analysis(room_id: str):
                 ],
             )
 
-            # 최근 대화 전체를 다시 계산한 결과로 스냅샷을 교체한다.
-            # 과거 오탐을 단순 누적 병합하면 수정 후에도 잘못된 영화/OTT
-            # 성향이 영구히 남으므로, 동일 문맥의 재분석 결과를 진실값으로 쓴다.
-            members = result.members
+            # 새 메시지에서 찾은 조건을 방의 기존 선호 스냅샷에 합친다.
+            # 좋아요/싫어요처럼 반대 의미가 들어오면 _merge_preferences가
+            # 이전 값을 제거하므로 조건 누적과 명시적 수정이 함께 동작한다.
+            members = _merge_preferences(
+                members,
+                result.members,
+            )
 
             database.save_preferences(
                 room_id,
@@ -1546,11 +1651,10 @@ def reset_room_chat(room_id: str):
         room_id
     )
 
-    for cache_key in [
-        key for key in _correction_cache
-        if key[0] == room_id
-    ]:
-        _correction_cache.pop(cache_key, None)
+    # 교정 결과는 상한이 있는 LRU 캐시이며 방 초기화 시 함께 비웁니다.
+    # functools.lru_cache는 방별 삭제를 제공하지 않으므로 전체 캐시를
+    # 비워 이전 대화의 교정 결과가 다시 사용되지 않게 합니다.
+    _correct_message.cache_clear()
 
     return {
         "room_id": room_id,
