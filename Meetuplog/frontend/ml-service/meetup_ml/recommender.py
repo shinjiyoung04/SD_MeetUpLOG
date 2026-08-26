@@ -1041,13 +1041,19 @@ def recommend(
         ):
             continue
 
-        if not movie.recommendation_eligible:
+        if (
+            not movie.recommendation_eligible
+            and not has_verified_requested_certification(
+                movie,
+                request.members,
+            )
+        ):
             excluded.append(
                 {
                     "movie_id": movie.internal_id,
                     "title": movie.title,
                     "reasons": [
-                        "포스터·줄거리·상세정보가 부족한 영화 제외"
+                        "추천 학습 정보 부족"
                     ],
                 }
             )
@@ -1492,8 +1498,9 @@ def recommend(
                 {
                     "allowed_providers": [],
                     "allowed_provider_types": [],
+                    "include_unknown_watch_path": True,
                 },
-                "특정 OTT 조건을 완화해 한국 이용 가능 작품 3편 구성",
+                "시청 경로 조건을 완화해 3편 구성",
             ),
             (
                 {

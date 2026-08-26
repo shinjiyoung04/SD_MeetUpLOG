@@ -5,11 +5,12 @@ import com.log.MeetupLog.domain.chat.entity.ChatMessage;
 import com.log.MeetupLog.domain.chat.repository.ChatMessageRepository;
 import com.log.MeetupLog.domain.chat.service.ChatService;
 import com.log.MeetupLog.domain.recommendation.dto.AiAnalysisEventResponse;
+import com.log.MeetupLog.domain.room.entity.ChatRoom;
 import com.log.MeetupLog.domain.room.entity.ChatRoomMember;
 import com.log.MeetupLog.domain.room.entity.MemberStatus;
 import com.log.MeetupLog.domain.room.entity.RoomRole;
 import com.log.MeetupLog.domain.room.repository.ChatRoomMemberRepository;
-
+import com.log.MeetupLog.domain.room.repository.ChatRoomRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.messaging.simp.SimpMessageSendingOperations;
@@ -35,6 +36,7 @@ public class AiRecommendationService {
     private static final int MAX_ANALYSIS_MESSAGES = 200;
 
     private final ChatRoomMemberRepository roomMemberRepository;
+    private final ChatRoomRepository roomRepository;
     private final ChatMessageRepository messageRepository;
     private final ChatService chatService;
     private final MlRecommendationClient mlRecommendationClient;
@@ -45,6 +47,18 @@ public class AiRecommendationService {
 
     public ChatMessageDto analyze(Long requesterId, Long roomId) {
         requireOwner(requesterId, roomId);
+
+        ChatRoom room = roomRepository.findById(roomId)
+                .orElseThrow(() -> new ResponseStatusException(
+                        HttpStatus.NOT_FOUND,
+                        "채팅방을 찾을 수 없습니다."
+                ));
+        if (room.getConfirmedMovieKey() != null && !room.getConfirmedMovieKey().isBlank()) {
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "이미 영화가 확정되어 AI 추천을 다시 실행할 수 없습니다."
+            );
+        }
 
         String analysisId = UUID.randomUUID().toString();
         if (runningAnalyses.putIfAbsent(roomId, analysisId) != null) {

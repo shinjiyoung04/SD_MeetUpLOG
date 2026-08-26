@@ -11,6 +11,8 @@ class Provider(BaseModel):
     name: str
     logo_path: str | None = None
     type: ProviderType
+    # Watchmode 등에서 검증된 작품별 OTT 웹 주소가 있을 때만 채웁니다.
+    detail_url: str | None = None
 
 
 class PersonCredit(BaseModel):

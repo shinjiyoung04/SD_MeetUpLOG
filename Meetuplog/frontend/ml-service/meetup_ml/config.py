@@ -9,6 +9,10 @@ class Settings(BaseSettings):
     kobis_api_key: str | None = None
     tmdb_base_url: str = "https://api.themoviedb.org/3"
     kobis_base_url: str = "https://www.kobis.or.kr/kobisopenapi/webservice/rest"
+    watchmode_api_key: str | None = None
+    watchmode_base_url: str = "https://api.watchmode.com/v1"
+    watchmode_region: str = "KR"
+    watchmode_timeout_seconds: float = 4.0
     meetup_data_dir: Path = Path("data")
     meetup_model_dir: Path = Path("models")
     meetup_db_path: Path = Path("data/meetup_test.db")
